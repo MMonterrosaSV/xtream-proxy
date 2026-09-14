@@ -1,74 +1,79 @@
 import os
 import time
 import re
+import hashlib
 from typing import Optional
-from urllib.parse import urljoin
+
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 import httpx
 
-app = FastAPI(title="Simple M3U → Xtream API")
+app = FastAPI(title="Simple M3U -> Xtream API")
 
 # === CONFIG (use Render Environment Variables in production) ===
-# Comma-separated list of M3U URLs to merge, e.g.:
-#   M3U_URLS=https://site1.com/list.m3u,https://site2.com/list.m3u,https://site3.com/list.m3u
-# M3U_URL (singular) is still read as a fallback for backwards compatibility.
-_raw_urls = os.getenv("M3U_URLS", os.getenv("M3U_URL", "https://example.com/your-playlist.m3u"))
-M3U_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
-
+M3U_URL = os.getenv("M3U_URL", "https://example.com/your-playlist.m3u")  # <-- your real M3U URL
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))  # refresh every 1 min
-SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
-
-# Some providers silently block requests that don't look like a real player.
-# Send a common player User-Agent on outbound requests instead of httpx's default.
-UPSTREAM_HEADERS = {
-    "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
-}
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
 
 # Simple in-memory cache
-_cache = {"channels": [], "categories": [], "fetched_at": 0}
+_cache = {"m3u": None, "channels": [], "categories": [], "fetched_at": 0}
+
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
 
 
-def _parse_m3u_text(content: str, channels: list, category_ids: dict, categories: list, next_stream_id: int) -> int:
-    """Parse one M3U's text content, appending into the shared channels/categories
-    lists. Returns the next available stream_id so IDs stay unique across sources."""
+def stable_id(*parts: str) -> int:
+    """
+    Deterministic ID derived from stable channel attributes (name + url),
+    NOT from position in the file. This keeps stream_id consistent across
+    refetches even if the upstream M3U reorders entries, so players don't
+    end up pointing at the wrong (or a "not updated") channel.
+    """
+    key = "|".join(parts)
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    # Keep it within a safe positive int range for players that assume int IDs
+    return int(digest[:8], 16) % 1_000_000_000
 
-    def get_category_id(group_name: str) -> str:
-        if group_name not in category_ids:
-            new_id = str(len(category_ids) + 1)
-            category_ids[group_name] = new_id
-            categories.append({
-                "category_id": new_id,
-                "category_name": group_name,
-                "parent_id": 0,
-            })
-        return category_ids[group_name]
+
+def fetch_and_parse_m3u(force: bool = False):
+    now = time.time()
+    if not force and _cache["m3u"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
+        return _cache["channels"], _cache["categories"]
+
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            # Cache-bust the upstream request too, in case the M3U host
+            # or any CDN in front of it caches based on the URL.
+            r = client.get(M3U_URL, headers={"Cache-Control": "no-cache"})
+            r.raise_for_status()
+            content = r.text
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch M3U: {e}")
+
+    channels = []
+    categories = {}  # name -> category_id
+    next_cat_id = 1
 
     lines = content.splitlines()
     i = 0
-    stream_id = next_stream_id
-
     while i < len(lines):
         line = lines[i].strip()
-
         if line.startswith("#EXTINF:"):
             name_match = re.search(r",(.+)$", line)
-            name = name_match.group(1).strip() if name_match else f"Channel {stream_id}"
+            name = name_match.group(1).strip() if name_match else "Channel"
 
             group = "Uncategorized"
-            logo = ""
-
             group_match = re.search(r'group-title="([^"]*)"', line)
-            if group_match and group_match.group(1).strip():
-                group = group_match.group(1).strip()
+            if group_match:
+                group = group_match.group(1).strip() or "Uncategorized"
 
+            logo = ""
             logo_match = re.search(r'tvg-logo="([^"]*)"', line)
             if logo_match:
                 logo = logo_match.group(1)
-
-            category_id = get_category_id(group)
 
             # Next non-empty line should be the URL
             i += 1
@@ -78,52 +83,37 @@ def _parse_m3u_text(content: str, channels: list, category_ids: dict, categories
             if i < len(lines):
                 url = lines[i].strip()
                 if url and not url.startswith("#"):
+                    if group not in categories:
+                        categories[group] = next_cat_id
+                        next_cat_id += 1
+                    cat_id = categories[group]
+
+                    sid = stable_id(name, url)
                     channels.append({
-                        "num": stream_id,
+                        "num": sid,
                         "name": name,
                         "stream_type": "live",
-                        "stream_id": stream_id,
+                        "stream_id": sid,
                         "stream_icon": logo,
                         "epg_channel_id": "",
-                        "category_id": category_id,
+                        "category_id": str(cat_id),
                         "category_name": group,
-                        "url": url,  # original stream URL
+                        "url": url,
                     })
-                    stream_id += 1
-        i += 1
+                i += 1
+        else:
+            i += 1
 
-    return stream_id
+    category_list = [
+        {"category_id": str(cid), "category_name": name, "parent_id": 0}
+        for name, cid in categories.items()
+    ]
 
-
-def fetch_and_parse_m3u():
-    now = time.time()
-    if _cache["channels"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
-        return _cache["channels"], _cache["categories"]
-
-    channels = []
-    category_ids = {}   # group_name -> category_id (shared across all sources)
-    categories = []
-    next_stream_id = 1
-
-    errors = []
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        for url in M3U_URLS:
-            try:
-                r = client.get(url)
-                r.raise_for_status()
-                next_stream_id = _parse_m3u_text(r.text, channels, category_ids, categories, next_stream_id)
-            except Exception as e:
-                # Don't let one bad source take down the whole playlist —
-                # just skip it and keep going with the others.
-                errors.append(f"{url}: {e}")
-
-    if not channels and errors:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch any M3U source: {'; '.join(errors)}")
-
+    _cache["m3u"] = content
     _cache["channels"] = channels
-    _cache["categories"] = categories
+    _cache["categories"] = category_list
     _cache["fetched_at"] = now
-    return channels, categories
+    return channels, category_list
 
 
 def check_auth(username: Optional[str], password: Optional[str]):
@@ -133,7 +123,7 @@ def check_auth(username: Optional[str], password: Optional[str]):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "M3U Xtream proxy is running", "sources": len(M3U_URLS)}
+    return {"status": "ok", "message": "M3U Xtream proxy is running"}
 
 
 @app.get("/player_api.php")
@@ -141,41 +131,13 @@ async def player_api(
     username: Optional[str] = Query(None),
     password: Optional[str] = Query(None),
     action: Optional[str] = Query(None),
+    refresh: Optional[int] = Query(0),
 ):
     check_auth(username, password)
-    channels, categories = fetch_and_parse_m3u()
-
-    # No action = the initial "login" request every Xtream player makes.
-    # Must return the user_info/server_info object, not a list.
-    if action is None:
-        return JSONResponse({
-            "user_info": {
-                "username": USERNAME,
-                "password": PASSWORD,
-                "message": "Active",
-                "auth": 1,
-                "status": "Active",
-                "exp_date": "4102444800",  # far future
-                "is_trial": "0",
-                "active_cons": "0",
-                "created_at": "1609459200",
-                "max_connections": "1",
-                "allowed_output_formats": ["m3u8", "ts"],
-            },
-            "server_info": {
-                "url": SERVER_URL,
-                "port": "443",
-                "https_port": "443",
-                "server_protocol": "https",
-                "rtmp_port": "0",
-                "timezone": "UTC",
-                "timestamp_now": int(time.time()),
-                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        })
+    channels, categories = fetch_and_parse_m3u(force=bool(refresh))
 
     if action == "get_live_categories":
-        return JSONResponse(categories)
+        return JSONResponse(categories, headers=NO_CACHE_HEADERS)
 
     if action == "get_live_streams":
         streams = []
@@ -194,9 +156,36 @@ async def player_api(
                 "direct_source": ch["url"],
                 "tv_archive_duration": 0,
             })
-        return JSONResponse(streams)
+        return JSONResponse(streams, headers=NO_CACHE_HEADERS)
 
-    return JSONResponse([])
+    if action is None:
+        return JSONResponse({
+            "user_info": {
+                "username": USERNAME,
+                "password": PASSWORD,
+                "message": "Active",
+                "auth": 1,
+                "status": "Active",
+                "exp_date": "4102444800",
+                "is_trial": "0",
+                "active_cons": "0",
+                "created_at": "1609459200",
+                "max_connections": "1",
+                "allowed_output_formats": ["m3u8", "ts"],
+            },
+            "server_info": {
+                "url": "your-render-url.onrender.com",
+                "port": "443",
+                "https_port": "443",
+                "server_protocol": "https",
+                "rtmp_port": "0",
+                "timezone": "UTC",
+                "timestamp_now": int(time.time()),
+                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        }, headers=NO_CACHE_HEADERS)
+
+    return JSONResponse([], headers=NO_CACHE_HEADERS)
 
 
 @app.get("/get.php")
@@ -205,9 +194,10 @@ async def get_php(
     password: Optional[str] = Query(None),
     type: Optional[str] = Query("m3u_plus"),
     output: Optional[str] = Query("ts"),
+    refresh: Optional[int] = Query(0),
 ):
     check_auth(username, password)
-    channels, _ = fetch_and_parse_m3u()
+    channels, _ = fetch_and_parse_m3u(force=bool(refresh))
 
     lines = ["#EXTM3U"]
     for ch in channels:
@@ -216,65 +206,19 @@ async def get_php(
         lines.append(f'#EXTINF:-1{logo}{group},{ch["name"]}')
         lines.append(ch["url"])
 
-    return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
+    return PlainTextResponse(
+        "\n".join(lines),
+        media_type="audio/x-mpegurl",
+        headers=NO_CACHE_HEADERS,
+    )
 
 
-# --- Live stream proxy ---
-# Accepts /live/USER/PASS/123 or /live/USER/PASS/123.ts or .m3u8 — players
-# commonly append a file extension, so we strip it instead of failing to match.
-@app.get("/live/{user}/{passwd}/{stream_id_ext}")
-async def live_stream(user: str, passwd: str, stream_id_ext: str):
+@app.get("/live/{user}/{passwd}/{stream_id}")
+async def live_stream(user: str, passwd: str, stream_id: int):
     check_auth(user, passwd)
-
-    match = re.match(r"^(\d+)", stream_id_ext)
-    if not match:
-        raise HTTPException(status_code=400, detail="Invalid stream id")
-    stream_id = int(match.group(1))
-
     channels, _ = fetch_and_parse_m3u()
-    target_url = None
     for ch in channels:
         if ch["stream_id"] == stream_id:
-            target_url = ch["url"]
-            break
-
-    if not target_url:
-        raise HTTPException(status_code=404, detail="Stream not found")
-
-    looks_like_hls = target_url.split("?")[0].endswith(".m3u8")
-
-    if looks_like_hls:
-        # HLS manifest: fetch the text, then rewrite every segment/sub-playlist
-        # reference to an ABSOLUTE url (relative to the real source). Relative
-        # paths would otherwise resolve against OUR server and 404, since the
-        # player thinks it got the manifest from us.
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
-                resp = await client.get(target_url)
-                resp.raise_for_status()
-                manifest_text = resp.text
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch HLS manifest: {e}")
-
-        rewritten_lines = []
-        for line in manifest_text.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                # This line is a segment or sub-playlist URL — make it absolute
-                rewritten_lines.append(urljoin(target_url, stripped))
-            else:
-                rewritten_lines.append(line)
-
-        return PlainTextResponse(
-            "\n".join(rewritten_lines),
-            media_type="application/vnd.apple.mpegurl",
-        )
-
-    # Raw continuous stream (.ts or unspecified) — proxy bytes directly
-    async def proxy_bytes():
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
-            async with client.stream("GET", target_url) as upstream:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-
-    return StreamingResponse(proxy_bytes(), media_type="video/mp2t")
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(ch["url"])
+    raise HTTPException(status_code=404, detail="Stream not found")
