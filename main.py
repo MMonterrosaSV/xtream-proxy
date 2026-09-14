@@ -9,33 +9,24 @@ import httpx
 app = FastAPI(title="Simple M3U → Xtream API")
 
 # === CONFIG (use Render Environment Variables in production) ===
-M3U_URL = os.getenv("M3U_URL", "https://example.com/your-playlist.m3u")  # <-- your real M3U URL
+# Comma-separated list of M3U URLs to merge, e.g.:
+#   M3U_URLS=https://site1.com/list.m3u,https://site2.com/list.m3u,https://site3.com/list.m3u
+# M3U_URL (singular) is still read as a fallback for backwards compatibility.
+_raw_urls = os.getenv("M3U_URLS", os.getenv("M3U_URL", "https://example.com/your-playlist.m3u"))
+M3U_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
+
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
 
 # Simple in-memory cache
-_cache = {"m3u": None, "channels": [], "categories": [], "fetched_at": 0}
+_cache = {"channels": [], "categories": [], "fetched_at": 0}
 
 
-def fetch_and_parse_m3u():
-    now = time.time()
-    if _cache["m3u"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
-        return _cache["channels"], _cache["categories"]
-
-    try:
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            r = client.get(M3U_URL)
-            r.raise_for_status()
-            content = r.text
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch M3U: {e}")
-
-    channels = []
-    # Track categories in order of first appearance, keyed by group name
-    category_ids = {}  # group_name -> category_id (as string)
-    categories = []     # list of {"category_id", "category_name", "parent_id"}
+def _parse_m3u_text(content: str, channels: list, category_ids: dict, categories: list, next_stream_id: int) -> int:
+    """Parse one M3U's text content, appending into the shared channels/categories
+    lists. Returns the next available stream_id so IDs stay unique across sources."""
 
     def get_category_id(group_name: str) -> str:
         if group_name not in category_ids:
@@ -50,13 +41,12 @@ def fetch_and_parse_m3u():
 
     lines = content.splitlines()
     i = 0
-    stream_id = 1
+    stream_id = next_stream_id
 
     while i < len(lines):
         line = lines[i].strip()
 
         if line.startswith("#EXTINF:"):
-            # Basic parse: name and optional group/logo
             name_match = re.search(r",(.+)$", line)
             name = name_match.group(1).strip() if name_match else f"Channel {stream_id}"
 
@@ -95,7 +85,34 @@ def fetch_and_parse_m3u():
                     stream_id += 1
         i += 1
 
-    _cache["m3u"] = content
+    return stream_id
+
+
+def fetch_and_parse_m3u():
+    now = time.time()
+    if _cache["channels"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
+        return _cache["channels"], _cache["categories"]
+
+    channels = []
+    category_ids = {}   # group_name -> category_id (shared across all sources)
+    categories = []
+    next_stream_id = 1
+
+    errors = []
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        for url in M3U_URLS:
+            try:
+                r = client.get(url)
+                r.raise_for_status()
+                next_stream_id = _parse_m3u_text(r.text, channels, category_ids, categories, next_stream_id)
+            except Exception as e:
+                # Don't let one bad source take down the whole playlist —
+                # just skip it and keep going with the others.
+                errors.append(f"{url}: {e}")
+
+    if not channels and errors:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch any M3U source: {'; '.join(errors)}")
+
     _cache["channels"] = channels
     _cache["categories"] = categories
     _cache["fetched_at"] = now
@@ -109,7 +126,7 @@ def check_auth(username: Optional[str], password: Optional[str]):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "M3U Xtream proxy is running"}
+    return {"status": "ok", "message": "M3U Xtream proxy is running", "sources": len(M3U_URLS)}
 
 
 @app.get("/player_api.php")
@@ -151,7 +168,6 @@ async def player_api(
         })
 
     if action == "get_live_categories":
-        # Real categories, built from each channel's group-title
         return JSONResponse(categories)
 
     if action == "get_live_streams":
