@@ -18,7 +18,7 @@ M3U_URLS = [u.strip() for u in _raw_urls.split(",") if u.strip()]
 
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "600"))  # refresh every 10 min
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
 
 # Some providers silently block requests that don't look like a real player.
