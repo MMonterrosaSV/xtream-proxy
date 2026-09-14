@@ -3,7 +3,8 @@ import time
 import re
 from typing import Optional
 from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
+import httpx
 
 app = FastAPI(title="Simple M3U → Xtream API")
 
@@ -13,8 +14,6 @@ USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
-
-import httpx
 
 # Simple in-memory cache
 _cache = {"m3u": None, "channels": [], "fetched_at": 0}
@@ -74,7 +73,7 @@ def fetch_and_parse_m3u():
                         "epg_channel_id": "",
                         "category_id": "1",
                         "category_name": group,
-                        "url": url,  # original stream URL (player will use it or we can proxy later)
+                        "url": url,  # original stream URL
                     })
                     stream_id += 1
         i += 1
@@ -104,9 +103,8 @@ async def player_api(
     check_auth(username, password)
     channels = fetch_and_parse_m3u()
 
-    # --- No action = the initial "login" request every Xtream player makes.
-    # This MUST return the user_info/server_info object, not a list,
-    # or the app will show "server response is in an incorrect format".
+    # No action = the initial "login" request every Xtream player makes.
+    # Must return the user_info/server_info object, not a list.
     if action is None:
         return JSONResponse({
             "user_info": {
@@ -135,12 +133,10 @@ async def player_api(
         })
 
     if action == "get_live_categories":
-        # Simple single category for now
         cats = [{"category_id": "1", "category_name": "All Channels", "parent_id": 0}]
         return JSONResponse(cats)
 
     if action == "get_live_streams":
-        # Return the list in Xtream-like format
         streams = []
         for ch in channels:
             streams.append({
@@ -154,7 +150,7 @@ async def player_api(
                 "category_id": "1",
                 "custom_sid": "",
                 "tv_archive": 0,
-                "direct_source": ch["url"],  # many players use this
+                "direct_source": ch["url"],
                 "tv_archive_duration": 0,
             })
         return JSONResponse(streams)
@@ -172,7 +168,6 @@ async def get_php(
     check_auth(username, password)
     channels = fetch_and_parse_m3u()
 
-    # Generate a simple M3U
     lines = ["#EXTM3U"]
     for ch in channels:
         logo = f' tvg-logo="{ch["stream_icon"]}"' if ch["stream_icon"] else ""
@@ -183,14 +178,38 @@ async def get_php(
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
 
 
-# Optional: live stream redirect (basic)
-@app.get("/live/{user}/{passwd}/{stream_id}")
-async def live_stream(user: str, passwd: str, stream_id: int):
+# --- Live stream proxy ---
+# Accepts /live/USER/PASS/123 or /live/USER/PASS/123.ts or .m3u8 — players
+# commonly append a file extension, so we strip it instead of failing to match.
+@app.get("/live/{user}/{passwd}/{stream_id_ext}")
+async def live_stream(user: str, passwd: str, stream_id_ext: str):
     check_auth(user, passwd)
+
+    match = re.match(r"^(\d+)", stream_id_ext)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid stream id")
+    stream_id = int(match.group(1))
+
     channels = fetch_and_parse_m3u()
+    target_url = None
     for ch in channels:
         if ch["stream_id"] == stream_id:
-            # Redirect to original URL (or implement full proxy if needed)
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(ch["url"])
-    raise HTTPException(status_code=404, detail="Stream not found")
+            target_url = ch["url"]
+            break
+
+    if not target_url:
+        raise HTTPException(status_code=404, detail="Stream not found")
+
+    async def proxy_bytes():
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+            async with client.stream("GET", target_url) as upstream:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+
+    # Default to MPEG-TS; if the source is HLS (.m3u8) this still works fine
+    # since we're just relaying bytes, not transcoding.
+    media_type = "video/mp2t"
+    if stream_id_ext.endswith(".m3u8"):
+        media_type = "application/vnd.apple.mpegurl"
+
+    return StreamingResponse(proxy_bytes(), media_type=media_type)
