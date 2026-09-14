@@ -16,13 +16,13 @@ CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
 
 # Simple in-memory cache
-_cache = {"m3u": None, "channels": [], "fetched_at": 0}
+_cache = {"m3u": None, "channels": [], "categories": [], "fetched_at": 0}
 
 
 def fetch_and_parse_m3u():
     now = time.time()
     if _cache["m3u"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
-        return _cache["channels"]
+        return _cache["channels"], _cache["categories"]
 
     try:
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
@@ -33,6 +33,21 @@ def fetch_and_parse_m3u():
         raise HTTPException(status_code=502, detail=f"Failed to fetch M3U: {e}")
 
     channels = []
+    # Track categories in order of first appearance, keyed by group name
+    category_ids = {}  # group_name -> category_id (as string)
+    categories = []     # list of {"category_id", "category_name", "parent_id"}
+
+    def get_category_id(group_name: str) -> str:
+        if group_name not in category_ids:
+            new_id = str(len(category_ids) + 1)
+            category_ids[group_name] = new_id
+            categories.append({
+                "category_id": new_id,
+                "category_name": group_name,
+                "parent_id": 0,
+            })
+        return category_ids[group_name]
+
     lines = content.splitlines()
     i = 0
     stream_id = 1
@@ -49,12 +64,14 @@ def fetch_and_parse_m3u():
             logo = ""
 
             group_match = re.search(r'group-title="([^"]*)"', line)
-            if group_match:
-                group = group_match.group(1)
+            if group_match and group_match.group(1).strip():
+                group = group_match.group(1).strip()
 
             logo_match = re.search(r'tvg-logo="([^"]*)"', line)
             if logo_match:
                 logo = logo_match.group(1)
+
+            category_id = get_category_id(group)
 
             # Next non-empty line should be the URL
             i += 1
@@ -71,7 +88,7 @@ def fetch_and_parse_m3u():
                         "stream_id": stream_id,
                         "stream_icon": logo,
                         "epg_channel_id": "",
-                        "category_id": "1",
+                        "category_id": category_id,
                         "category_name": group,
                         "url": url,  # original stream URL
                     })
@@ -80,8 +97,9 @@ def fetch_and_parse_m3u():
 
     _cache["m3u"] = content
     _cache["channels"] = channels
+    _cache["categories"] = categories
     _cache["fetched_at"] = now
-    return channels
+    return channels, categories
 
 
 def check_auth(username: Optional[str], password: Optional[str]):
@@ -101,7 +119,7 @@ async def player_api(
     action: Optional[str] = Query(None),
 ):
     check_auth(username, password)
-    channels = fetch_and_parse_m3u()
+    channels, categories = fetch_and_parse_m3u()
 
     # No action = the initial "login" request every Xtream player makes.
     # Must return the user_info/server_info object, not a list.
@@ -133,8 +151,8 @@ async def player_api(
         })
 
     if action == "get_live_categories":
-        cats = [{"category_id": "1", "category_name": "All Channels", "parent_id": 0}]
-        return JSONResponse(cats)
+        # Real categories, built from each channel's group-title
+        return JSONResponse(categories)
 
     if action == "get_live_streams":
         streams = []
@@ -147,7 +165,7 @@ async def player_api(
                 "stream_icon": ch["stream_icon"],
                 "epg_channel_id": "",
                 "added": str(int(time.time())),
-                "category_id": "1",
+                "category_id": ch["category_id"],
                 "custom_sid": "",
                 "tv_archive": 0,
                 "direct_source": ch["url"],
@@ -166,7 +184,7 @@ async def get_php(
     output: Optional[str] = Query("ts"),
 ):
     check_auth(username, password)
-    channels = fetch_and_parse_m3u()
+    channels, _ = fetch_and_parse_m3u()
 
     lines = ["#EXTM3U"]
     for ch in channels:
@@ -190,7 +208,7 @@ async def live_stream(user: str, passwd: str, stream_id_ext: str):
         raise HTTPException(status_code=400, detail="Invalid stream id")
     stream_id = int(match.group(1))
 
-    channels = fetch_and_parse_m3u()
+    channels, _ = fetch_and_parse_m3u()
     target_url = None
     for ch in channels:
         if ch["stream_id"] == stream_id:
