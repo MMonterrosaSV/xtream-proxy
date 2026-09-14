@@ -16,7 +16,7 @@ M3U_URLS: List[str] = [u.strip() for u in M3U_URLS_RAW.split(",") if u.strip()]
 
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh interval
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))  # refresh interval
 
 # Simple in-memory cache
 _cache = {"channels": [], "fetched_at": 0, "sources_ok": 0, "sources_failed": []}
