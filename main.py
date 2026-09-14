@@ -16,7 +16,7 @@ M3U_URLS: List[str] = [u.strip() for u in M3U_URLS_RAW.split(",") if u.strip()]
 
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))  # refresh interval
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh interval
 
 # Simple in-memory cache
 _cache = {"channels": [], "fetched_at": 0, "sources_ok": 0, "sources_failed": []}
@@ -152,7 +152,7 @@ async def player_api(
     check_auth(username, password)
     channels = fetch_and_parse_m3u()
 
-    if action is None or action == "get_live_categories":
+    if action == "get_live_categories":
         cats = [{"category_id": "1", "category_name": "All Channels", "parent_id": 0}]
         return JSONResponse(cats)
 
@@ -176,6 +176,9 @@ async def player_api(
         return JSONResponse(streams)
 
     if action is None:
+        # Login/handshake call — this MUST return user_info/server_info,
+        # not a channel or category list, or players will reject it as
+        # an invalid/malformed response.
         return JSONResponse({
             "user_info": {
                 "username": USERNAME,
