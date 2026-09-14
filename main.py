@@ -4,7 +4,6 @@ import re
 from typing import Optional
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
-import httpx
 
 app = FastAPI(title="Simple M3U → Xtream API")
 
@@ -13,9 +12,13 @@ M3U_URL = os.getenv("M3U_URL", "https://example.com/your-playlist.m3u")  # <-- y
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
+SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
+
+import httpx
 
 # Simple in-memory cache
 _cache = {"m3u": None, "channels": [], "fetched_at": 0}
+
 
 def fetch_and_parse_m3u():
     now = time.time()
@@ -34,17 +37,22 @@ def fetch_and_parse_m3u():
     lines = content.splitlines()
     i = 0
     stream_id = 1
+
     while i < len(lines):
         line = lines[i].strip()
+
         if line.startswith("#EXTINF:"):
             # Basic parse: name and optional group/logo
             name_match = re.search(r",(.+)$", line)
             name = name_match.group(1).strip() if name_match else f"Channel {stream_id}"
+
             group = "Uncategorized"
             logo = ""
+
             group_match = re.search(r'group-title="([^"]*)"', line)
             if group_match:
                 group = group_match.group(1)
+
             logo_match = re.search(r'tvg-logo="([^"]*)"', line)
             if logo_match:
                 logo = logo_match.group(1)
@@ -53,6 +61,7 @@ def fetch_and_parse_m3u():
             i += 1
             while i < len(lines) and not lines[i].strip():
                 i += 1
+
             if i < len(lines):
                 url = lines[i].strip()
                 if url and not url.startswith("#"):
@@ -75,13 +84,16 @@ def fetch_and_parse_m3u():
     _cache["fetched_at"] = now
     return channels
 
+
 def check_auth(username: Optional[str], password: Optional[str]):
     if username != USERNAME or password != PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "M3U Xtream proxy is running"}
+
 
 @app.get("/player_api.php")
 async def player_api(
@@ -92,7 +104,37 @@ async def player_api(
     check_auth(username, password)
     channels = fetch_and_parse_m3u()
 
-    if action is None or action == "get_live_categories":
+    # --- No action = the initial "login" request every Xtream player makes.
+    # This MUST return the user_info/server_info object, not a list,
+    # or the app will show "server response is in an incorrect format".
+    if action is None:
+        return JSONResponse({
+            "user_info": {
+                "username": USERNAME,
+                "password": PASSWORD,
+                "message": "Active",
+                "auth": 1,
+                "status": "Active",
+                "exp_date": "4102444800",  # far future
+                "is_trial": "0",
+                "active_cons": "0",
+                "created_at": "1609459200",
+                "max_connections": "1",
+                "allowed_output_formats": ["m3u8", "ts"],
+            },
+            "server_info": {
+                "url": SERVER_URL,
+                "port": "443",
+                "https_port": "443",
+                "server_protocol": "https",
+                "rtmp_port": "0",
+                "timezone": "UTC",
+                "timestamp_now": int(time.time()),
+                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        })
+
+    if action == "get_live_categories":
         # Simple single category for now
         cats = [{"category_id": "1", "category_name": "All Channels", "parent_id": 0}]
         return JSONResponse(cats)
@@ -117,35 +159,8 @@ async def player_api(
             })
         return JSONResponse(streams)
 
-    # Basic user/server info (required by many players)
-    if action is None:
-        return JSONResponse({
-            "user_info": {
-                "username": USERNAME,
-                "password": PASSWORD,
-                "message": "Active",
-                "auth": 1,
-                "status": "Active",
-                "exp_date": "4102444800",  # far future
-                "is_trial": "0",
-                "active_cons": "0",
-                "created_at": "1609459200",
-                "max_connections": "1",
-                "allowed_output_formats": ["m3u8", "ts"],
-            },
-            "server_info": {
-                "url": "your-render-url.onrender.com",  # will be overridden by player usually
-                "port": "443",
-                "https_port": "443",
-                "server_protocol": "https",
-                "rtmp_port": "0",
-                "timezone": "UTC",
-                "timestamp_now": int(time.time()),
-                "time_now": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        })
-
     return JSONResponse([])
+
 
 @app.get("/get.php")
 async def get_php(
@@ -164,7 +179,9 @@ async def get_php(
         group = f' group-title="{ch["category_name"]}"' if ch["category_name"] else ""
         lines.append(f'#EXTINF:-1{logo}{group},{ch["name"]}')
         lines.append(ch["url"])
+
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
+
 
 # Optional: live stream redirect (basic)
 @app.get("/live/{user}/{passwd}/{stream_id}")
