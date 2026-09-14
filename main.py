@@ -2,6 +2,7 @@ import os
 import time
 import re
 from typing import Optional
+from urllib.parse import urljoin
 from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 import httpx
@@ -19,6 +20,12 @@ USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))  # refresh every 5 min
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")  # set this to your real deployed host
+
+# Some providers silently block requests that don't look like a real player.
+# Send a common player User-Agent on outbound requests instead of httpx's default.
+UPSTREAM_HEADERS = {
+    "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
+}
 
 # Simple in-memory cache
 _cache = {"channels": [], "categories": [], "fetched_at": 0}
@@ -234,16 +241,40 @@ async def live_stream(user: str, passwd: str, stream_id_ext: str):
     if not target_url:
         raise HTTPException(status_code=404, detail="Stream not found")
 
+    looks_like_hls = target_url.split("?")[0].endswith(".m3u8")
+
+    if looks_like_hls:
+        # HLS manifest: fetch the text, then rewrite every segment/sub-playlist
+        # reference to an ABSOLUTE url (relative to the real source). Relative
+        # paths would otherwise resolve against OUR server and 404, since the
+        # player thinks it got the manifest from us.
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
+                resp = await client.get(target_url)
+                resp.raise_for_status()
+                manifest_text = resp.text
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch HLS manifest: {e}")
+
+        rewritten_lines = []
+        for line in manifest_text.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                # This line is a segment or sub-playlist URL — make it absolute
+                rewritten_lines.append(urljoin(target_url, stripped))
+            else:
+                rewritten_lines.append(line)
+
+        return PlainTextResponse(
+            "\n".join(rewritten_lines),
+            media_type="application/vnd.apple.mpegurl",
+        )
+
+    # Raw continuous stream (.ts or unspecified) — proxy bytes directly
     async def proxy_bytes():
-        async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
             async with client.stream("GET", target_url) as upstream:
                 async for chunk in upstream.aiter_bytes():
                     yield chunk
 
-    # Default to MPEG-TS; if the source is HLS (.m3u8) this still works fine
-    # since we're just relaying bytes, not transcoding.
-    media_type = "video/mp2t"
-    if stream_id_ext.endswith(".m3u8"):
-        media_type = "application/vnd.apple.mpegurl"
-
-    return StreamingResponse(proxy_bytes(), media_type=media_type)
+    return StreamingResponse(proxy_bytes(), media_type="video/mp2t")
