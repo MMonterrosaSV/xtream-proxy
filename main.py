@@ -1,20 +1,18 @@
 import os
 import time
 import re
-from typing import Optional, Dict, List, Tuple
-from urllib.parse import urljoin
+from typing import Optional, Dict, List, Tuple, Any
+from urllib.parse import urljoin, urlparse, parse_qs
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 import httpx
 
-app = FastAPI(title="Simple M3U → Xtream API (Live + Movies + Series)")
+app = FastAPI(title="Simple M3U → Xtream API (Live + Movies + Series + TMDB)")
 
-# === CONFIG (use Render Environment Variables in production) ===
-# Live channels (your existing sources)
+# === CONFIG ===
 _raw_live = os.getenv("M3U_URLS", os.getenv("M3U_URL", "https://example.com/your-playlist.m3u"))
 LIVE_M3U_URLS = [u.strip() for u in _raw_live.split(",") if u.strip()]
 
-# Movies & Series (defaults to the two sources you asked for)
 MOVIES_M3U_URL = os.getenv(
     "MOVIES_M3U_URL",
     "https://raw.githubusercontent.com/MMonterrosaSV/IPTV/refs/heads/main/MOVIES"
@@ -28,10 +26,13 @@ USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
 CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
 UPSTREAM_HEADERS = {
     "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 }
+
+TMDB_IMG = "https://image.tmdb.org/t/p"
 
 # In-memory caches
 _cache = {
@@ -39,11 +40,14 @@ _cache = {
     "live_categories": [],
     "vod_streams": [],
     "vod_categories": [],
-    "series_list": [],          # list of series objects
+    "series_list": [],
     "series_categories": [],
-    "series_episodes": {},      # series_id -> list of episodes
+    "series_episodes": {},
     "fetched_at": 0,
 }
+
+# Persistent metadata cache (survives playlist refreshes)
+_tmdb_cache: Dict[str, dict] = {}   # key = "tt123" or "tmdb:123" → full info dict
 
 
 def _get_category_id(group_name: str, category_ids: dict, categories: list) -> str:
@@ -58,6 +62,156 @@ def _get_category_id(group_name: str, category_ids: dict, categories: list) -> s
     return category_ids[group_name]
 
 
+def _extract_ids_from_url_or_name(url: str, name: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (imdb_id, tmdb_id)
+    Looks in the resolve URL first, then in the title.
+    """
+    imdb_id = None
+    tmdb_id = None
+
+    # From URL query param ?url=...
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        raw = (qs.get("url") or [None])[0]
+        if raw:
+            raw = raw.strip()
+            if re.match(r"^tt\d+$", raw, re.I):
+                imdb_id = raw.lower()
+            elif raw.isdigit():
+                tmdb_id = raw
+    except Exception:
+        pass
+
+    # Fallback: look inside the name
+    if not imdb_id:
+        m = re.search(r"(tt\d+)", name, re.I)
+        if m:
+            imdb_id = m.group(1).lower()
+    if not tmdb_id:
+        m = re.search(r"\b(\d{3,7})\b", name)
+        # only take it if it looks like a pure TMDB id and no IMDB was found
+        if m and not imdb_id:
+            tmdb_id = m.group(1)
+
+    return imdb_id, tmdb_id
+
+
+def _tmdb_get(path: str, params: dict = None) -> Optional[dict]:
+    if not TMDB_API_KEY:
+        return None
+    params = params or {}
+    params["api_key"] = TMDB_API_KEY
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            r = client.get(f"https://api.themoviedb.org/3{path}", params=params)
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] = None) -> Optional[dict]:
+    """Fetch and normalize movie metadata. Returns a dict ready for Xtream or None."""
+    cache_key = None
+    if imdb_id:
+        cache_key = imdb_id
+    elif tmdb_id:
+        cache_key = f"tmdb:{tmdb_id}"
+
+    if cache_key and cache_key in _tmdb_cache:
+        return _tmdb_cache[cache_key]
+
+    movie_id = None
+
+    # Resolve IMDB → TMDB id
+    if imdb_id:
+        data = _tmdb_get(f"/find/{imdb_id}", {"external_source": "imdb_id"})
+        if data and data.get("movie_results"):
+            movie_id = data["movie_results"][0]["id"]
+    elif tmdb_id:
+        movie_id = tmdb_id
+
+    if not movie_id:
+        return None
+
+    # Full details + credits + videos
+    details = _tmdb_get(
+        f"/movie/{movie_id}",
+        {"append_to_response": "credits,videos", "language": "en-US"}
+    )
+    if not details:
+        return None
+
+    # Poster & backdrop
+    poster = f"{TMDB_IMG}/w500{details['poster_path']}" if details.get("poster_path") else ""
+    poster_big = f"{TMDB_IMG}/original{details['poster_path']}" if details.get("poster_path") else ""
+    backdrop = f"{TMDB_IMG}/original{details['backdrop_path']}" if details.get("backdrop_path") else ""
+
+    # Genres
+    genres = ", ".join(g["name"] for g in details.get("genres", []))
+
+    # Director & cast
+    director = ""
+    cast_list = []
+    credits = details.get("credits") or {}
+    for person in credits.get("crew", []):
+        if person.get("job") == "Director":
+            director = person.get("name", "")
+            break
+    for person in credits.get("cast", [])[:8]:
+        cast_list.append(person.get("name", ""))
+    cast = ", ".join(cast_list)
+
+    # Trailer (YouTube key)
+    trailer = ""
+    for v in (details.get("videos") or {}).get("results", []):
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+            trailer = v.get("key", "")
+            break
+
+    runtime = details.get("runtime") or 0
+    rating = round(details.get("vote_average") or 0, 1)
+
+    meta = {
+        "tmdb_id": str(details.get("id", "")),
+        "imdb_id": details.get("imdb_id") or imdb_id or "",
+        "name": details.get("title") or details.get("original_title") or "",
+        "o_name": details.get("original_title") or "",
+        "movie_image": poster,
+        "cover_big": poster_big,
+        "backdrop_path": [backdrop] if backdrop else [],
+        "plot": details.get("overview") or "",
+        "description": details.get("overview") or "",
+        "releasedate": details.get("release_date") or "",
+        "genre": genres,
+        "director": director,
+        "actors": cast,
+        "cast": cast,
+        "rating": str(rating),
+        "rating_5based": round(rating / 2, 1),
+        "duration_secs": runtime * 60,
+        "duration": f"{runtime // 60:02d}:{runtime % 60:02d}:00" if runtime else "00:00:00",
+        "episode_run_time": str(runtime),
+        "youtube_trailer": trailer,
+        "country": ", ".join(c["name"] for c in details.get("production_countries", [])),
+        "age": "",
+        "status": details.get("status") or "",
+    }
+
+    if cache_key:
+        _tmdb_cache[cache_key] = meta
+    # also cache under the other id if present
+    if meta["imdb_id"] and meta["imdb_id"] != cache_key:
+        _tmdb_cache[meta["imdb_id"]] = meta
+    if meta["tmdb_id"]:
+        _tmdb_cache[f"tmdb:{meta['tmdb_id']}"] = meta
+
+    return meta
+
+
 def _parse_m3u_text(
     content: str,
     live_channels: list,
@@ -66,26 +220,24 @@ def _parse_m3u_text(
     vod_streams: list,
     vod_cat_ids: dict,
     vod_categories: list,
-    series_map: dict,          # name -> series dict
+    series_map: dict,
     series_cat_ids: dict,
     series_categories: list,
     next_live_id: int,
     next_vod_id: int,
     next_series_id: int,
 ) -> Tuple[int, int, int]:
-    """Parse one M3U. Returns updated (next_live_id, next_vod_id, next_series_id)."""
     lines = content.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i].strip()
         if line.startswith("#EXTINF:"):
-            # Extract attributes
             name_match = re.search(r",(.+)$", line)
             name = name_match.group(1).strip() if name_match else "Unknown"
 
             group = "Uncategorized"
             logo = ""
-            item_type = "live"  # default
+            item_type = "live"
 
             group_match = re.search(r'group-title="([^"]*)"', line)
             if group_match and group_match.group(1).strip():
@@ -99,7 +251,6 @@ def _parse_m3u_text(
             if type_match:
                 item_type = type_match.group(1).lower()
 
-            # Next non-empty line = URL
             i += 1
             while i < len(lines) and not lines[i].strip():
                 i += 1
@@ -112,26 +263,38 @@ def _parse_m3u_text(
 
             if item_type == "movie":
                 cat_id = _get_category_id(group, vod_cat_ids, vod_categories)
+
+                # Try to get basic poster early (non-blocking if cache miss)
+                imdb_id, tmdb_id = _extract_ids_from_url_or_name(url, name)
+                meta = None
+                if TMDB_API_KEY and (imdb_id or tmdb_id):
+                    # Only use already-cached data during parse (to keep parse fast)
+                    cache_key = imdb_id or f"tmdb:{tmdb_id}"
+                    meta = _tmdb_cache.get(cache_key)
+
+                stream_icon = (meta["movie_image"] if meta else logo) or logo
+
                 vod_streams.append({
                     "num": next_vod_id,
-                    "name": name,
+                    "name": (meta["name"] if meta else name),
                     "stream_type": "movie",
                     "stream_id": next_vod_id,
-                    "stream_icon": logo,
-                    "rating": "0",
-                    "rating_5based": 0,
+                    "stream_icon": stream_icon,
+                    "rating": meta["rating"] if meta else "0",
+                    "rating_5based": meta["rating_5based"] if meta else 0,
                     "added": str(int(time.time())),
                     "category_id": cat_id,
                     "container_extension": "mp4",
                     "custom_sid": "",
                     "direct_source": url,
                     "url": url,
+                    # internal helpers
+                    "_imdb_id": imdb_id,
+                    "_tmdb_id": tmdb_id,
                 })
                 next_vod_id += 1
 
             elif item_type == "series":
-                # Try to extract series name + SxxExx from the title
-                # e.g. "A KNIGHT OF THE SEVEN KINGDOMS S01E01 The Hedge Knight"
                 series_name = name
                 season_num = 1
                 episode_num = 1
@@ -164,7 +327,7 @@ def _parse_m3u_text(
                         "youtube_trailer": "",
                         "episode_run_time": "0",
                         "category_id": cat_id,
-                        "episodes": {},  # season -> list of episodes
+                        "episodes": {},
                     }
                     next_series_id += 1
 
@@ -173,7 +336,6 @@ def _parse_m3u_text(
                 if season_key not in series["episodes"]:
                     series["episodes"][season_key] = []
 
-                # episode id = unique across everything (we reuse next_vod_id style)
                 ep_id = next_vod_id
                 next_vod_id += 1
 
@@ -196,7 +358,6 @@ def _parse_m3u_text(
                 })
 
             else:
-                # live (default)
                 cat_id = _get_category_id(group, live_cat_ids, live_categories)
                 live_channels.append({
                     "num": next_live_id,
@@ -234,7 +395,6 @@ def fetch_and_parse_all():
     next_live_id = 1
     next_vod_id = 1
     next_series_id = 1
-
     errors = []
 
     all_urls = LIVE_M3U_URLS + [MOVIES_M3U_URL, SERIES_M3U_URL]
@@ -259,11 +419,8 @@ def fetch_and_parse_all():
     if not live_channels and not vod_streams and not series_map and errors:
         raise HTTPException(status_code=502, detail=f"Failed to fetch any M3U source: {'; '.join(errors)}")
 
-    # Build final series list + episodes lookup
     series_list = list(series_map.values())
-    series_episodes = {}
-    for s in series_list:
-        series_episodes[s["series_id"]] = s["episodes"]
+    series_episodes = {s["series_id"]: s["episodes"] for s in series_list}
 
     _cache["live_channels"] = live_channels
     _cache["live_categories"] = live_categories
@@ -284,10 +441,12 @@ def check_auth(username: Optional[str], password: Optional[str]):
 def root():
     return {
         "status": "ok",
-        "message": "M3U Xtream proxy is running (Live + Movies + Series)",
+        "message": "M3U Xtream proxy (Live + Movies + Series + TMDB)",
         "live_sources": len(LIVE_M3U_URLS),
         "movies_url": MOVIES_M3U_URL,
         "series_url": SERIES_M3U_URL,
+        "tmdb_enabled": bool(TMDB_API_KEY),
+        "tmdb_cached_movies": len(_tmdb_cache),
     }
 
 
@@ -302,7 +461,6 @@ async def player_api(
     check_auth(username, password)
     fetch_and_parse_all()
 
-    # Login / account info
     if action is None:
         return JSONResponse({
             "user_info": {
@@ -330,7 +488,7 @@ async def player_api(
             }
         })
 
-    # ---------- LIVE ----------
+    # LIVE
     if action == "get_live_categories":
         return JSONResponse(_cache["live_categories"])
 
@@ -353,50 +511,100 @@ async def player_api(
             })
         return JSONResponse(streams)
 
-    # ---------- VOD / MOVIES ----------
+    # VOD / MOVIES
     if action == "get_vod_categories":
         return JSONResponse(_cache["vod_categories"])
 
     if action == "get_vod_streams":
-        return JSONResponse(_cache["vod_streams"])
+        # Return cleaned list (no internal _imdb_id etc.)
+        clean = []
+        for v in _cache["vod_streams"]:
+            clean.append({
+                "num": v["num"],
+                "name": v["name"],
+                "stream_type": "movie",
+                "stream_id": v["stream_id"],
+                "stream_icon": v["stream_icon"],
+                "rating": v["rating"],
+                "rating_5based": v["rating_5based"],
+                "added": v["added"],
+                "category_id": v["category_id"],
+                "container_extension": "mp4",
+                "custom_sid": "",
+                "direct_source": v["url"],
+            })
+        return JSONResponse(clean)
 
     if action == "get_vod_info":
-        # optional, some players ask for it
         if not vod_id:
             return JSONResponse({})
+
+        target = None
         for v in _cache["vod_streams"]:
             if str(v["stream_id"]) == str(vod_id):
-                return JSONResponse({
-                    "info": {
-                        "name": v["name"],
-                        "movie_image": v["stream_icon"],
-                        "plot": "",
-                        "cast": "",
-                        "director": "",
-                        "genre": "",
-                        "releaseDate": "",
-                        "rating": v.get("rating", "0"),
-                        "duration_secs": 0,
-                        "duration": "00:00:00",
-                    },
-                    "movie_data": {
-                        "stream_id": v["stream_id"],
-                        "name": v["name"],
-                        "added": v["added"],
-                        "category_id": v["category_id"],
-                        "container_extension": "mp4",
-                        "custom_sid": "",
-                        "direct_source": v["url"],
-                    }
-                })
-        return JSONResponse({})
+                target = v
+                break
+        if not target:
+            return JSONResponse({})
 
-    # ---------- SERIES ----------
+        # Enrich on demand
+        meta = None
+        if TMDB_API_KEY:
+            meta = _fetch_movie_metadata(
+                imdb_id=target.get("_imdb_id"),
+                tmdb_id=target.get("_tmdb_id"),
+            )
+
+        if meta:
+            # Update the cached stream icon/name for next list request
+            target["stream_icon"] = meta["movie_image"] or target["stream_icon"]
+            target["name"] = meta["name"] or target["name"]
+            target["rating"] = meta["rating"]
+            target["rating_5based"] = meta["rating_5based"]
+
+            return JSONResponse({
+                "info": meta,
+                "movie_data": {
+                    "stream_id": target["stream_id"],
+                    "name": meta["name"],
+                    "added": target["added"],
+                    "category_id": target["category_id"],
+                    "container_extension": "mp4",
+                    "custom_sid": "",
+                    "direct_source": target["url"],
+                }
+            })
+        else:
+            # Fallback without TMDB
+            return JSONResponse({
+                "info": {
+                    "name": target["name"],
+                    "movie_image": target["stream_icon"],
+                    "plot": "",
+                    "cast": "",
+                    "director": "",
+                    "genre": "",
+                    "releaseDate": "",
+                    "rating": target.get("rating", "0"),
+                    "duration_secs": 0,
+                    "duration": "00:00:00",
+                },
+                "movie_data": {
+                    "stream_id": target["stream_id"],
+                    "name": target["name"],
+                    "added": target["added"],
+                    "category_id": target["category_id"],
+                    "container_extension": "mp4",
+                    "custom_sid": "",
+                    "direct_source": target["url"],
+                }
+            })
+
+    # SERIES
     if action == "get_series_categories":
         return JSONResponse(_cache["series_categories"])
 
     if action == "get_series":
-        # Return list of series (without full episode data)
         result = []
         for s in _cache["series_list"]:
             result.append({
@@ -465,21 +673,17 @@ async def get_php(
 
     lines = ["#EXTM3U"]
 
-    # Live
     for ch in _cache["live_channels"]:
         logo = f' tvg-logo="{ch["stream_icon"]}"' if ch["stream_icon"] else ""
         group = f' group-title="{ch["category_name"]}"' if ch["category_name"] else ""
         lines.append(f'#EXTINF:-1{logo}{group},{ch["name"]}')
         lines.append(ch["url"])
 
-    # Movies
     for v in _cache["vod_streams"]:
         logo = f' tvg-logo="{v["stream_icon"]}"' if v["stream_icon"] else ""
-        group = f' group-title="Movies"'  # or use real category if you prefer
-        lines.append(f'#EXTINF:-1 type="movie"{logo}{group},{v["name"]}')
+        lines.append(f'#EXTINF:-1 type="movie"{logo} group-title="Movies",{v["name"]}')
         lines.append(v["url"])
 
-    # Series episodes
     for s in _cache["series_list"]:
         for season, eps in s["episodes"].items():
             for ep in eps:
@@ -490,8 +694,6 @@ async def get_php(
 
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
 
-
-# ---------- Stream proxies ----------
 
 async def _proxy_stream(target_url: str):
     looks_like_hls = target_url.split("?")[0].endswith(".m3u8")
@@ -557,9 +759,6 @@ async def movie_stream(user: str, passwd: str, stream_id_ext: str):
 
 @app.get("/series/{user}/{passwd}/{stream_id_ext}")
 async def series_stream(user: str, passwd: str, stream_id_ext: str):
-    """
-    Xtream players request episodes as /series/USER/PASS/{episode_id}.ext
-    """
     check_auth(user, passwd)
     match = re.match(r"^(\d+)", stream_id_ext)
     if not match:
