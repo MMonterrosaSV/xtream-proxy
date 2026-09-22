@@ -34,7 +34,6 @@ UPSTREAM_HEADERS = {
 
 TMDB_IMG = "https://image.tmdb.org/t/p"
 
-# In-memory caches
 _cache = {
     "live_channels": [],
     "live_categories": [],
@@ -46,11 +45,13 @@ _cache = {
     "fetched_at": 0,
 }
 
-# Persistent metadata cache (survives playlist refreshes)
-_tmdb_cache: Dict[str, dict] = {}   # key = "tt123" or "tmdb:123" → full info dict
+_tmdb_movie_cache: Dict[str, dict] = {}
+_tmdb_series_cache: Dict[str, dict] = {}
 
 
 def _get_category_id(group_name: str, category_ids: dict, categories: list) -> str:
+    if not group_name:
+        group_name = "Uncategorized"
     if group_name not in category_ids:
         new_id = str(len(category_ids) + 1)
         category_ids[group_name] = new_id
@@ -62,15 +63,9 @@ def _get_category_id(group_name: str, category_ids: dict, categories: list) -> s
     return category_ids[group_name]
 
 
-def _extract_ids_from_url_or_name(url: str, name: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (imdb_id, tmdb_id)
-    Looks in the resolve URL first, then in the title.
-    """
+def _extract_movie_ids(url: str, name: str) -> Tuple[Optional[str], Optional[str]]:
     imdb_id = None
     tmdb_id = None
-
-    # From URL query param ?url=...
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
@@ -83,19 +78,25 @@ def _extract_ids_from_url_or_name(url: str, name: str) -> Tuple[Optional[str], O
                 tmdb_id = raw
     except Exception:
         pass
-
-    # Fallback: look inside the name
     if not imdb_id:
         m = re.search(r"(tt\d+)", name, re.I)
         if m:
             imdb_id = m.group(1).lower()
-    if not tmdb_id:
-        m = re.search(r"\b(\d{3,7})\b", name)
-        # only take it if it looks like a pure TMDB id and no IMDB was found
-        if m and not imdb_id:
-            tmdb_id = m.group(1)
-
     return imdb_id, tmdb_id
+
+
+def _extract_series_id_from_url(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        raw = (qs.get("url") or [None])[0]
+        if raw:
+            parts = raw.strip().split("/")
+            if parts and parts[0].isdigit():
+                return parts[0]
+    except Exception:
+        pass
+    return None
 
 
 def _tmdb_get(path: str, params: dict = None) -> Optional[dict]:
@@ -114,19 +115,11 @@ def _tmdb_get(path: str, params: dict = None) -> Optional[dict]:
 
 
 def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] = None) -> Optional[dict]:
-    """Fetch and normalize movie metadata. Returns a dict ready for Xtream or None."""
-    cache_key = None
-    if imdb_id:
-        cache_key = imdb_id
-    elif tmdb_id:
-        cache_key = f"tmdb:{tmdb_id}"
-
-    if cache_key and cache_key in _tmdb_cache:
-        return _tmdb_cache[cache_key]
+    cache_key = imdb_id or (f"tmdb:{tmdb_id}" if tmdb_id else None)
+    if cache_key and cache_key in _tmdb_movie_cache:
+        return _tmdb_movie_cache[cache_key]
 
     movie_id = None
-
-    # Resolve IMDB → TMDB id
     if imdb_id:
         data = _tmdb_get(f"/find/{imdb_id}", {"external_source": "imdb_id"})
         if data and data.get("movie_results"):
@@ -137,7 +130,6 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
     if not movie_id:
         return None
 
-    # Full details + credits + videos
     details = _tmdb_get(
         f"/movie/{movie_id}",
         {"append_to_response": "credits,videos", "language": "en-US"}
@@ -145,15 +137,14 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
     if not details:
         return None
 
-    # Poster & backdrop
     poster = f"{TMDB_IMG}/w500{details['poster_path']}" if details.get("poster_path") else ""
     poster_big = f"{TMDB_IMG}/original{details['poster_path']}" if details.get("poster_path") else ""
     backdrop = f"{TMDB_IMG}/original{details['backdrop_path']}" if details.get("backdrop_path") else ""
 
-    # Genres
-    genres = ", ".join(g["name"] for g in details.get("genres", []))
+    genres_list = [g["name"] for g in details.get("genres", [])]
+    primary_genre = genres_list[0] if genres_list else ""
+    genres = ", ".join(genres_list)
 
-    # Director & cast
     director = ""
     cast_list = []
     credits = details.get("credits") or {}
@@ -165,7 +156,6 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
         cast_list.append(person.get("name", ""))
     cast = ", ".join(cast_list)
 
-    # Trailer (YouTube key)
     trailer = ""
     for v in (details.get("videos") or {}).get("results", []):
         if v.get("site") == "YouTube" and v.get("type") == "Trailer":
@@ -187,6 +177,7 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
         "description": details.get("overview") or "",
         "releasedate": details.get("release_date") or "",
         "genre": genres,
+        "primary_genre": primary_genre,          # used for category
         "director": director,
         "actors": cast,
         "cast": cast,
@@ -202,13 +193,72 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
     }
 
     if cache_key:
-        _tmdb_cache[cache_key] = meta
-    # also cache under the other id if present
-    if meta["imdb_id"] and meta["imdb_id"] != cache_key:
-        _tmdb_cache[meta["imdb_id"]] = meta
+        _tmdb_movie_cache[cache_key] = meta
+    if meta["imdb_id"]:
+        _tmdb_movie_cache[meta["imdb_id"]] = meta
     if meta["tmdb_id"]:
-        _tmdb_cache[f"tmdb:{meta['tmdb_id']}"] = meta
+        _tmdb_movie_cache[f"tmdb:{meta['tmdb_id']}"] = meta
 
+    return meta
+
+
+def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
+    cache_key = f"tmdb:{tmdb_id}"
+    if cache_key in _tmdb_series_cache:
+        return _tmdb_series_cache[cache_key]
+
+    details = _tmdb_get(
+        f"/tv/{tmdb_id}",
+        {"append_to_response": "credits,videos", "language": "en-US"}
+    )
+    if not details:
+        return None
+
+    poster = f"{TMDB_IMG}/w500{details['poster_path']}" if details.get("poster_path") else ""
+    poster_big = f"{TMDB_IMG}/original{details['poster_path']}" if details.get("poster_path") else ""
+    backdrop = f"{TMDB_IMG}/original{details['backdrop_path']}" if details.get("backdrop_path") else ""
+
+    genres_list = [g["name"] for g in details.get("genres", [])]
+    primary_genre = genres_list[0] if genres_list else ""
+    genres = ", ".join(genres_list)
+
+    cast_list = []
+    credits = details.get("credits") or {}
+    for person in credits.get("cast", [])[:8]:
+        cast_list.append(person.get("name", ""))
+    cast = ", ".join(cast_list)
+
+    created_by = ", ".join(c.get("name", "") for c in details.get("created_by", [])[:3])
+
+    trailer = ""
+    for v in (details.get("videos") or {}).get("results", []):
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+            trailer = v.get("key", "")
+            break
+
+    rating = round(details.get("vote_average") or 0, 1)
+    runtime = (details.get("episode_run_time") or [0])[0] if details.get("episode_run_time") else 0
+
+    meta = {
+        "tmdb_id": str(details.get("id", "")),
+        "name": details.get("name") or details.get("original_name") or "",
+        "cover": poster,
+        "cover_big": poster_big,
+        "backdrop_path": [backdrop] if backdrop else [],
+        "plot": details.get("overview") or "",
+        "cast": cast,
+        "director": created_by,
+        "genre": genres,
+        "primary_genre": primary_genre,          # used for category
+        "releaseDate": details.get("first_air_date") or "",
+        "last_modified": str(int(time.time())),
+        "rating": str(rating),
+        "rating_5based": round(rating / 2, 1),
+        "youtube_trailer": trailer,
+        "episode_run_time": str(runtime),
+    }
+
+    _tmdb_series_cache[cache_key] = meta
     return meta
 
 
@@ -263,34 +313,42 @@ def _parse_m3u_text(
 
             if item_type == "movie":
                 cat_id = _get_category_id(group, vod_cat_ids, vod_categories)
+                imdb_id, tmdb_id = _extract_movie_ids(url, name)
 
-                # Try to get basic poster early (non-blocking if cache miss)
-                imdb_id, tmdb_id = _extract_ids_from_url_or_name(url, name)
                 meta = None
                 if TMDB_API_KEY and (imdb_id or tmdb_id):
-                    # Only use already-cached data during parse (to keep parse fast)
                     cache_key = imdb_id or f"tmdb:{tmdb_id}"
-                    meta = _tmdb_cache.get(cache_key)
+                    meta = _tmdb_movie_cache.get(cache_key)
 
+                display_name = meta["name"] if meta else name
                 stream_icon = (meta["movie_image"] if meta else logo) or logo
+                rating = meta["rating"] if meta else "0"
+                rating_5 = meta["rating_5based"] if meta else 0
+
+                # Prefer TMDB primary genre for category if we already have it
+                final_group = group
+                if meta and meta.get("primary_genre"):
+                    final_group = meta["primary_genre"]
+                    cat_id = _get_category_id(final_group, vod_cat_ids, vod_categories)
 
                 vod_streams.append({
                     "num": next_vod_id,
-                    "name": (meta["name"] if meta else name),
+                    "name": display_name,
                     "stream_type": "movie",
                     "stream_id": next_vod_id,
                     "stream_icon": stream_icon,
-                    "rating": meta["rating"] if meta else "0",
-                    "rating_5based": meta["rating_5based"] if meta else 0,
+                    "rating": rating,
+                    "rating_5based": rating_5,
                     "added": str(int(time.time())),
                     "category_id": cat_id,
+                    "category_name": final_group,
                     "container_extension": "mp4",
                     "custom_sid": "",
                     "direct_source": url,
                     "url": url,
-                    # internal helpers
                     "_imdb_id": imdb_id,
                     "_tmdb_id": tmdb_id,
+                    "_original_group": group,
                 })
                 next_vod_id += 1
 
@@ -308,30 +366,46 @@ def _parse_m3u_text(
                     episode_title = se_match.group(4).strip() or f"Episode {episode_num}"
 
                 cat_id = _get_category_id(group, series_cat_ids, series_categories)
+                tmdb_series_id = _extract_series_id_from_url(url)
 
                 if series_name not in series_map:
+                    meta = None
+                    if TMDB_API_KEY and tmdb_series_id:
+                        meta = _tmdb_series_cache.get(f"tmdb:{tmdb_series_id}")
+
+                    final_group = group
+                    if meta and meta.get("primary_genre"):
+                        final_group = meta["primary_genre"]
+                        cat_id = _get_category_id(final_group, series_cat_ids, series_categories)
+
                     series_map[series_name] = {
                         "num": next_series_id,
-                        "name": series_name,
+                        "name": meta["name"] if meta else series_name,
                         "series_id": next_series_id,
-                        "cover": logo,
-                        "plot": "",
-                        "cast": "",
-                        "director": "",
-                        "genre": group,
-                        "releaseDate": "",
+                        "cover": (meta["cover"] if meta else logo) or logo,
+                        "plot": meta["plot"] if meta else "",
+                        "cast": meta["cast"] if meta else "",
+                        "director": meta["director"] if meta else "",
+                        "genre": meta["genre"] if meta else group,
+                        "releaseDate": meta["releaseDate"] if meta else "",
                         "last_modified": str(int(time.time())),
-                        "rating": "0",
-                        "rating_5based": 0,
-                        "backdrop_path": [],
-                        "youtube_trailer": "",
-                        "episode_run_time": "0",
+                        "rating": meta["rating"] if meta else "0",
+                        "rating_5based": meta["rating_5based"] if meta else 0,
+                        "backdrop_path": meta["backdrop_path"] if meta else [],
+                        "youtube_trailer": meta["youtube_trailer"] if meta else "",
+                        "episode_run_time": meta["episode_run_time"] if meta else "0",
                         "category_id": cat_id,
+                        "category_name": final_group,
                         "episodes": {},
+                        "_tmdb_id": tmdb_series_id,
+                        "_original_group": group,
                     }
                     next_series_id += 1
 
                 series = series_map[series_name]
+                if tmdb_series_id and not series.get("_tmdb_id"):
+                    series["_tmdb_id"] = tmdb_series_id
+
                 season_key = str(season_num)
                 if season_key not in series["episodes"]:
                     series["episodes"][season_key] = []
@@ -446,7 +520,8 @@ def root():
         "movies_url": MOVIES_M3U_URL,
         "series_url": SERIES_M3U_URL,
         "tmdb_enabled": bool(TMDB_API_KEY),
-        "tmdb_cached_movies": len(_tmdb_cache),
+        "tmdb_cached_movies": len(_tmdb_movie_cache),
+        "tmdb_cached_series": len(_tmdb_series_cache),
     }
 
 
@@ -516,7 +591,6 @@ async def player_api(
         return JSONResponse(_cache["vod_categories"])
 
     if action == "get_vod_streams":
-        # Return cleaned list (no internal _imdb_id etc.)
         clean = []
         for v in _cache["vod_streams"]:
             clean.append({
@@ -547,7 +621,6 @@ async def player_api(
         if not target:
             return JSONResponse({})
 
-        # Enrich on demand
         meta = None
         if TMDB_API_KEY:
             meta = _fetch_movie_metadata(
@@ -556,11 +629,25 @@ async def player_api(
             )
 
         if meta:
-            # Update the cached stream icon/name for next list request
+            target["name"] = meta["name"]
             target["stream_icon"] = meta["movie_image"] or target["stream_icon"]
-            target["name"] = meta["name"] or target["name"]
             target["rating"] = meta["rating"]
             target["rating_5based"] = meta["rating_5based"]
+
+            # Option A: TMDB primary genre → category, else keep original
+            new_group = meta.get("primary_genre") or target.get("_original_group") or "Uncategorized"
+            # Update category if needed
+            cat_ids = {c["category_name"]: c["category_id"] for c in _cache["vod_categories"]}
+            if new_group not in cat_ids:
+                new_id = str(len(_cache["vod_categories"]) + 1)
+                _cache["vod_categories"].append({
+                    "category_id": new_id,
+                    "category_name": new_group,
+                    "parent_id": 0,
+                })
+                cat_ids[new_group] = new_id
+            target["category_id"] = cat_ids[new_group]
+            target["category_name"] = new_group
 
             return JSONResponse({
                 "info": meta,
@@ -575,7 +662,6 @@ async def player_api(
                 }
             })
         else:
-            # Fallback without TMDB
             return JSONResponse({
                 "info": {
                     "name": target["name"],
@@ -631,32 +717,70 @@ async def player_api(
         if not series_id:
             return JSONResponse({})
         sid = int(series_id)
+
+        target = None
         for s in _cache["series_list"]:
             if s["series_id"] == sid:
-                return JSONResponse({
-                    "seasons": [
-                        {"season_number": int(k), "name": f"Season {k}", "cover": s["cover"]}
-                        for k in sorted(s["episodes"].keys(), key=int)
-                    ],
-                    "info": {
-                        "name": s["name"],
-                        "cover": s["cover"],
-                        "plot": s["plot"],
-                        "cast": s["cast"],
-                        "director": s["director"],
-                        "genre": s["genre"],
-                        "releaseDate": s["releaseDate"],
-                        "last_modified": s["last_modified"],
-                        "rating": s["rating"],
-                        "rating_5based": s["rating_5based"],
-                        "backdrop_path": s["backdrop_path"],
-                        "youtube_trailer": s["youtube_trailer"],
-                        "episode_run_time": s["episode_run_time"],
-                        "category_id": s["category_id"],
-                    },
-                    "episodes": s["episodes"],
+                target = s
+                break
+        if not target:
+            return JSONResponse({})
+
+        meta = None
+        if TMDB_API_KEY and target.get("_tmdb_id"):
+            meta = _fetch_series_metadata(target["_tmdb_id"])
+
+        if meta:
+            target["name"] = meta["name"]
+            target["cover"] = meta["cover"] or target["cover"]
+            target["plot"] = meta["plot"]
+            target["cast"] = meta["cast"]
+            target["director"] = meta["director"]
+            target["genre"] = meta["genre"] or target["genre"]
+            target["releaseDate"] = meta["releaseDate"]
+            target["rating"] = meta["rating"]
+            target["rating_5based"] = meta["rating_5based"]
+            target["backdrop_path"] = meta["backdrop_path"]
+            target["youtube_trailer"] = meta["youtube_trailer"]
+            target["episode_run_time"] = meta["episode_run_time"]
+
+            # Option A: TMDB primary genre → category, else keep original
+            new_group = meta.get("primary_genre") or target.get("_original_group") or "Uncategorized"
+            cat_ids = {c["category_name"]: c["category_id"] for c in _cache["series_categories"]}
+            if new_group not in cat_ids:
+                new_id = str(len(_cache["series_categories"]) + 1)
+                _cache["series_categories"].append({
+                    "category_id": new_id,
+                    "category_name": new_group,
+                    "parent_id": 0,
                 })
-        return JSONResponse({})
+                cat_ids[new_group] = new_id
+            target["category_id"] = cat_ids[new_group]
+            target["category_name"] = new_group
+
+        return JSONResponse({
+            "seasons": [
+                {"season_number": int(k), "name": f"Season {k}", "cover": target["cover"]}
+                for k in sorted(target["episodes"].keys(), key=int)
+            ],
+            "info": {
+                "name": target["name"],
+                "cover": target["cover"],
+                "plot": target["plot"],
+                "cast": target["cast"],
+                "director": target["director"],
+                "genre": target["genre"],
+                "releaseDate": target["releaseDate"],
+                "last_modified": target["last_modified"],
+                "rating": target["rating"],
+                "rating_5based": target["rating_5based"],
+                "backdrop_path": target["backdrop_path"],
+                "youtube_trailer": target["youtube_trailer"],
+                "episode_run_time": target["episode_run_time"],
+                "category_id": target["category_id"],
+            },
+            "episodes": target["episodes"],
+        })
 
     return JSONResponse([])
 
@@ -681,7 +805,8 @@ async def get_php(
 
     for v in _cache["vod_streams"]:
         logo = f' tvg-logo="{v["stream_icon"]}"' if v["stream_icon"] else ""
-        lines.append(f'#EXTINF:-1 type="movie"{logo} group-title="Movies",{v["name"]}')
+        group = f' group-title="{v.get("category_name", "Movies")}"'
+        lines.append(f'#EXTINF:-1 type="movie"{logo}{group},{v["name"]}')
         lines.append(v["url"])
 
     for s in _cache["series_list"]:
@@ -689,7 +814,8 @@ async def get_php(
             for ep in eps:
                 logo = f' tvg-logo="{ep["info"]["movie_image"]}"' if ep["info"]["movie_image"] else ""
                 title = f'{s["name"]} S{season.zfill(2)}E{str(ep["episode_num"]).zfill(2)} {ep["title"]}'
-                lines.append(f'#EXTINF:-1 type="series"{logo} group-title="{s["genre"]}",{title}')
+                group = f' group-title="{s.get("category_name", s.get("genre", "Series"))}"'
+                lines.append(f'#EXTINF:-1 type="series"{logo}{group},{title}')
                 lines.append(ep["url"])
 
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
